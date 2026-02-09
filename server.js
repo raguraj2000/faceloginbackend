@@ -6,7 +6,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { connectToMongo } = require('./mongodb');
 const { createClerkClient } = require('@clerk/clerk-sdk-node');
-const logger = require('./logger');
+const logger = require('./utils/logger');
 
 // ============================================================================
 // CONSTANTS
@@ -182,10 +182,6 @@ function generateJWT(payload) {
  * 3. If role is 'user', DENY access (Users cannot signin via password).
  * 4. Upsert to MongoDB with correct role.
  */
-// Add this route
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', message: 'Backend is running' });
-});
 app.post('/api/signin', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -375,32 +371,37 @@ app.post(
 // ============================================================================
 // ROUTE: /api/userinfo
 // ============================================================================
-app.post('/api/userinfo', authMiddleware, async (req, res) => {
-  try {
-    const { userid } = req.body;
+app.post(
+  '/api/userinfo',
+  authMiddleware,
+  checkRole('admin'),
+  async (req, res) => {
+    try {
+      const { userid } = req.body;
 
-    if (!userid) {
-      return sendError(res, 400, 'User ID is required');
+      if (!userid) {
+        return sendError(res, 400, 'User ID is required');
+      }
+
+      // LOGIC FIX:
+      // Since we removed authMiddleware from /recognize, 'user' role accounts
+      // literally CANNOT have a token to access this route.
+      // Only 'admin' and 'staff' can be authenticated here.
+      // Therefore, we allow them to see any logs.
+
+      const db = await connectToMongo();
+      const logs = await db
+        .collection('logger')
+        .find({ userId: userid }, { projection: { awsFaceId: 0 } }) // Hide awsFaceId for privacy
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      sendSuccess(res, { logs, count: logs.length });
+    } catch (error) {
+      sendError(res, 500, 'Failed to retrieve info', error);
     }
-
-    // LOGIC FIX:
-    // Since we removed authMiddleware from /recognize, 'user' role accounts
-    // literally CANNOT have a token to access this route.
-    // Only 'admin' and 'staff' can be authenticated here.
-    // Therefore, we allow them to see any logs.
-
-    const db = await connectToMongo();
-    const logs = await db
-      .collection('logger')
-      .find({ userId: userid }, { projection: { awsFaceId: 0 } }) // Hide awsFaceId for privacy
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    sendSuccess(res, { logs, count: logs.length });
-  } catch (error) {
-    sendError(res, 500, 'Failed to retrieve info', error);
-  }
-});
+  },
+);
 
 /**
  * POST /api/recognize - Mark Attendance (Admin, Staff, User)
@@ -513,151 +514,170 @@ app.post(
 // ============================================================================
 // ADMIN ONLY ROUTES
 // ============================================================================
-app.post('/api/reports', async (req, res) => {
-  try {
-    const { startDate, endDate } = req.body;
+app.post(
+  '/api/reports',
+  authMiddleware,
+  checkRole('admin'),
+  async (req, res) => {
+    try {
+      const { startDate, endDate } = req.body;
+      console.log('startDate', startDate);
 
-    if (!startDate || !endDate) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Date range is required' });
-    }
+      if (!startDate || !endDate) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Date range is required' });
+      }
 
-    const db = await connectToMongo();
+      const db = await connectToMongo();
 
-    // 1. Create date range
-    const startOfDay = new Date(startDate);
-    startOfDay.setHours(0, 0, 0, 0);
+      // 1. Create date range
+      const startOfDay = new Date(startDate);
+      startOfDay.setHours(0, 0, 0, 0);
 
-    const endOfDay = new Date(endDate);
-    endOfDay.setHours(23, 59, 59, 999);
+      const endOfDay = new Date(endDate);
+      endOfDay.setHours(23, 59, 59, 999);
 
-    // 2. Get Logs (Directly filter by date, no need to fetch all users first)
-    // FIX: Changed 'creadedAt' to 'createdAt'
-    const logs = await db
-      .collection('logger')
-      .find(
-        {
-          createdAt: {
-            // <--- FIXED TYPO
-            $gte: startOfDay,
-            $lte: endOfDay,
+      // 2. Get Logs (Directly filter by date, no need to fetch all users first)
+      // FIX: Changed 'creadedAt' to 'createdAt'
+      const logs = await db
+        .collection('logger')
+        .find(
+          {
+            createdAt: {
+              // <--- FIXED TYPO
+              $gte: startOfDay,
+              $lte: endOfDay,
+            },
           },
-        },
-        { projection: { awsFaceId: 0 } },
-      )
-      .sort({ createdAt: -1 }) // Sort newest first
-      .toArray();
+          { projection: { awsFaceId: 0 } },
+        )
+        .sort({ createdAt: -1 }) // Sort newest first
+        .toArray();
 
-    // 3. Get User Details for the logs found (Optimization)
-    // Extract unique user IDs from the logs
-    const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
+      // 3. Get User Details for the logs found (Optimization)
+      // Extract unique user IDs from the logs
+      const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
 
-    // Fetch details ONLY for these users
-    const userDetails = await db
-      .collection('users')
-      .find({ userId: { $in: uniqueUserIds } })
-      .project({ _id: 0, awsFaceId: 0, password: 0 }) // Hide sensitive fields
-      .toArray();
+      // Fetch details ONLY for these users
+      const userDetails = await db
+        .collection('users')
+        .find({ userId: { $in: uniqueUserIds } })
+        .project({ _id: 0, awsFaceId: 0, password: 0 }) // Hide sensitive fields
+        .toArray();
 
-    // 4. Combine Data (Map logs to user names)
-    const reportData = logs.map((log) => {
-      const user = userDetails.find((u) => u.userId === log.userId);
-      return {
-        ...log,
-        userName: user
-          ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
-            user.userId
-          : 'Unknown',
-        userRole: user ? user.role : 'unknown',
-      };
-    });
-    console.log('api/reportsdayreportData', reportData);
-    res.json({
-      success: true,
-      data: reportData,
-    });
-  } catch (error) {
-    console.error('Reports error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.post('/api/reports/month', async (req, res) => {
-  try {
-    const { date: monthName, year } = req.body;
-
-    // Default to current year if not provided
-    const targetYear = year ? parseInt(year) : new Date().getFullYear();
-
-    if (!monthName) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Month name is required' });
+      // 4. Combine Data (Map logs to user names)
+      const reportData = logs.map((log) => {
+        const user = userDetails.find((u) => u.userId === log.userId);
+        return {
+          ...log,
+          userName: user
+            ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+              user.userId
+            : 'Unknown',
+          userRole: user ? user.role : 'unknown',
+        };
+      });
+      console.log('api/reportsdayreportData', reportData);
+      res.json({
+        success: true,
+        data: reportData,
+      });
+    } catch (error) {
+      console.error('Reports error:', error);
+      res.status(500).json({ success: false, error: error.message });
     }
+  },
+);
 
-    const db = await connectToMongo();
+app.post(
+  '/api/reports/month',
+  authMiddleware,
+  checkRole('admin'),
+  async (req, res) => {
+    try {
+      const { date: monthName, year } = req.body;
 
-    // 1. Convert month name to index (e.g. "January" -> 0)
-    const monthIndex = new Date(`${monthName} 1, ${targetYear}`).getMonth();
-    if (isNaN(monthIndex)) {
-      return res
-        .status(400)
-        .json({ success: false, error: 'Invalid month name' });
-    }
+      // Default to current year if not provided
+      const targetYear = year ? parseInt(year) : new Date().getFullYear();
 
-    // 2. Calculate start and end of month
-    const startOfMonth = new Date(targetYear, monthIndex, 1);
-    const endOfMonth = new Date(targetYear, monthIndex + 1, 0, 23, 59, 59, 999);
+      if (!monthName) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Month name is required' });
+      }
 
-    // 3. Get Logs
-    // FIX: Changed 'creadedAt' to 'createdAt'
-    const logs = await db
-      .collection('logger')
-      .find(
-        {
-          createdAt: {
-            // <--- FIXED TYPO
-            $gte: startOfMonth,
-            $lte: endOfMonth,
+      const db = await connectToMongo();
+
+      // 1. Convert month name to index (e.g. "January" -> 0)
+      const monthIndex = new Date(`${monthName} 1, ${targetYear}`).getMonth();
+      if (isNaN(monthIndex)) {
+        return res
+          .status(400)
+          .json({ success: false, error: 'Invalid month name' });
+      }
+
+      // 2. Calculate start and end of month
+      const startOfMonth = new Date(targetYear, monthIndex, 1);
+      const endOfMonth = new Date(
+        targetYear,
+        monthIndex + 1,
+        0,
+        23,
+        59,
+        59,
+        999,
+      );
+
+      // 3. Get Logs
+      // FIX: Changed 'creadedAt' to 'createdAt'
+      const logs = await db
+        .collection('logger')
+        .find(
+          {
+            createdAt: {
+              // <--- FIXED TYPO
+              $gte: startOfMonth,
+              $lte: endOfMonth,
+            },
           },
-        },
-        { projection: { awsFaceId: 0 } },
-      )
-      .sort({ createdAt: -1 })
-      .toArray();
+          { projection: { awsFaceId: 0 } },
+        )
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    // 4. Get User Details
-    const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
-    const userDetails = await db
-      .collection('users')
-      .find({ userId: { $in: uniqueUserIds } })
-      .project({ _id: 0, awsFaceId: 0 })
-      .toArray();
+      // 4. Get User Details
+      const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
+      const userDetails = await db
+        .collection('users')
+        .find({ userId: { $in: uniqueUserIds } })
+        .project({ _id: 0, awsFaceId: 0 })
+        .toArray();
 
-    // 5. Combine Data
-    const reportData = logs.map((log) => {
-      const user = userDetails.find((u) => u.userId === log.userId);
-      return {
-        ...log,
-        userName: user
-          ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
-            user.userId
-          : 'Unknown',
-        userRole: user ? user.role : 'unknown',
-      };
-    });
-    console.log('reportData', reportData);
+      // 5. Combine Data
+      const reportData = logs.map((log) => {
+        const user = userDetails.find((u) => u.userId === log.userId);
+        return {
+          ...log,
+          userName: user
+            ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+              user.userId
+            : 'Unknown',
+          userRole: user ? user.role : 'unknown',
+        };
+      });
+      console.log('reportData', reportData);
 
-    res.json({
-      success: true,
-      data: reportData,
-    });
-  } catch (error) {
-    console.error('Reports error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+      res.json({
+        success: true,
+        data: reportData,
+      });
+    } catch (error) {
+      console.error('Reports error:', error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  },
+);
 
 app.post(
   '/api/listusers',
@@ -838,5 +858,3 @@ const server = app.listen(config.PORT, '0.0.0.0', async () => {
 });
 
 module.exports = app;
-
-
