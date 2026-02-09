@@ -182,6 +182,10 @@ function generateJWT(payload) {
  * 3. If role is 'user', DENY access (Users cannot signin via password).
  * 4. Upsert to MongoDB with correct role.
  */
+// Add this route
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', message: 'Backend is running' });
+});
 app.post('/api/signin', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -834,4 +838,5 @@ const server = app.listen(config.PORT, '0.0.0.0', async () => {
 });
 
 module.exports = app;
+
 
