@@ -1,0 +1,32 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@azure/cognitiveservices-face": "^5.0.0",
+    "@azure/ms-rest-azure-js": "^2.1.0",
+    "@azure/ms-rest-js": "^2.7.0",
+    "@clerk/clerk-sdk-node": "^4.13.23",
+    "aws-sdk": "^2.1692.0",
+    "axios": "^1.13.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "mongodb": "^7.0.0",
+    "multer": "^2.0.2",
+    "node-appwrite": "^21.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
