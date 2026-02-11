@@ -198,7 +198,40 @@ function checkRole(...allowedRoles) {
     next();
   };
 }
+// ============================================================================
+// ROUTE: GET /api/health (Public - Health Check)
+// ============================================================================
+app.get('/api/health', async (_req, res) => {
+  try {
+    const db = await connectToMongo();
+    await db.command({ ping: 1 });
 
+    return res.status(200).json({
+      success: true,
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      uptime: Math.floor(process.uptime()) + 's',
+      environment: config.NODE_ENV,
+    });
+  } catch (error) {
+    return res.status(503).json({
+      success: false,
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      error: 'Database connection failed',
+    });
+  }
+});
+
+// ============================================================================
+// ERROR HANDLER
+// ============================================================================
+app.use((err, _req, res, _next) => {
+  logger.error('Unhandled error:', err);
+  return res
+    .status(500)
+    .json({ success: false, message: 'Internal Server Error' });
+});
 // ============================================================================
 // ROUTE: POST /api/signin (Staff & Admin ONLY)
 // ============================================================================
@@ -981,4 +1014,5 @@ app.listen(config.PORT, '0.0.0.0', async () => {
 });
 
 module.exports = app;
+
 
