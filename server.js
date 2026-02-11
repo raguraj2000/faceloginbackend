@@ -6,7 +6,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { connectToMongo } = require('./mongodb');
 const { createClerkClient } = require('@clerk/clerk-sdk-node');
-const logger = require('./logger');
+const logger = require('./utils/logger');
 
 // ============================================================================
 // CONSTANTS
@@ -29,36 +29,27 @@ const config = {
     origin: process.env.CORS_ORIGIN || true,
     credentials: true,
   },
+  // Collection Names - Single source of truth
+  COLLECTIONS: {
+    STAFF: 'staff', // Admin & Staff accounts
+    WORKERS: 'workers', // Face-enrolled workers
+    ATTENDANCE: 'attendance', // IN/OUT logs
+    AUDIT: 'audit_logs', // Everything audited here
+  },
 };
 
 // ============================================================================
-// INITIALIZE EXPRESS & MIDDLEWARE
+// INITIALIZE
 // ============================================================================
 const app = express();
-
-// Helper: Check if two dates are the same day
-function isSameDay(date1, date2) {
-  const d1 = new Date(date1);
-  const d2 = new Date(date2);
-  return (
-    d1.getFullYear() === d2.getFullYear() &&
-    d1.getMonth() === d2.getMonth() &&
-    d1.getDate() === d2.getDate()
-  );
-}
-
-module.exports = { isSameDay };
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: config.FILE_SIZE_LIMIT },
   fileFilter: (_req, file, cb) => {
     const allowedMimes = ['image/jpeg', 'image/png', 'image/jpg'];
-    if (allowedMimes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only JPEG and PNG allowed.'));
-    }
+    if (allowedMimes.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Invalid file type. Only JPEG and PNG allowed.'));
   },
 });
 
@@ -75,51 +66,13 @@ const clerkClient = createClerkClient({
 app.use(cors(config.CORS));
 app.use(express.json());
 
+// Request Logger (with password redaction)
 app.use((req, _res, next) => {
-  logger.info(`[${req.method}] ${req.path}`, { body: req.body });
+  const sanitizedBody = { ...req.body };
+  if (sanitizedBody.password) sanitizedBody.password = '***REDACTED***';
+  logger.info(`[${req.method}] ${req.path}`, { body: sanitizedBody });
   next();
 });
-
-// ============================================================================
-// MIDDLEWARE
-// ============================================================================
-
-async function authMiddleware(req, res, next) {
-  console.log('authMiddleware', req.headers);
-
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) return sendError(res, 401, 'Authentication token required.');
-
-    const decoded = jwt.verify(token, config.JWT_SECRET);
-    const db = await connectToMongo();
-
-    // Find user in DB
-    const user = await db
-      .collection('users')
-      .findOne({ userId: decoded.userId });
-    if (!user) return sendError(res, 404, 'User not found.');
-
-    // Check Active/Locked status
-    if (!user.isActive) return sendError(res, 403, 'Account deactivated.');
-    if (user.isLocked) return sendError(res, 403, 'Account locked.');
-
-    req.user = user;
-    next();
-  } catch (error) {
-    sendError(res, 401, 'Invalid token.', error);
-  }
-}
-
-function checkRole(...allowedRoles) {
-  return (req, res, next) => {
-    if (!req.user) return sendError(res, 401, 'Auth required.');
-    if (!allowedRoles.includes(req.user.role)) {
-      return sendError(res, 403, 'Access denied. Insufficient permissions.');
-    }
-    next();
-  };
-}
 
 // ============================================================================
 // HELPERS
@@ -131,7 +84,7 @@ function validateRequiredFields(data, fields) {
 
 function sendError(res, statusCode, message, error = null) {
   logger.error(message, error);
-  res.status(statusCode).json({
+  return res.status(statusCode).json({
     success: false,
     message,
     ...(config.NODE_ENV === 'development' &&
@@ -140,17 +93,56 @@ function sendError(res, statusCode, message, error = null) {
 }
 
 function sendSuccess(res, data, statusCode = 200) {
-  res.status(statusCode).json({ success: true, ...data });
+  return res.status(statusCode).json({ success: true, ...data });
 }
 
+function generateJWT(payload) {
+  return jwt.sign(payload, config.JWT_SECRET, { expiresIn: config.JWT_EXPIRY });
+}
+
+// ============================================================================
+// AUDIT LOGGER - Logs everything to audit_logs collection
+// ============================================================================
+async function auditLog(action, performedBy, targetUser, details, req) {
+  try {
+    const db = await connectToMongo();
+    await db.collection(config.COLLECTIONS.AUDIT).insertOne({
+      action, // e.g., 'SIGNIN', 'ENROLL', 'ATTENDANCE_IN', 'ROLE_UPDATE'
+      performedBy, // userId of who did it (staff/admin) or 'SYSTEM'
+      targetUser, // userId of who it was done to (or null)
+      details, // Any extra info
+      ipAddress: req?.ip || req?.connection?.remoteAddress || null,
+      userAgent: req?.headers?.['user-agent'] || null,
+      createdAt: new Date(),
+    });
+  } catch (error) {
+    logger.error('Audit log failed', error);
+    // Don't throw — audit failure shouldn't break the app
+  }
+}
+
+// ============================================================================
+// AWS HELPERS
+// ============================================================================
 async function searchFaceByImage(imageBuffer) {
-  const params = {
-    CollectionId: config.AWS.COLLECTION_ID,
-    Image: { Bytes: imageBuffer },
-    MaxFaces: 1,
-    FaceMatchThreshold: config.FACE_MATCH_THRESHOLD,
-  };
-  return await rekognition.searchFacesByImage(params).promise();
+  try {
+    const params = {
+      CollectionId: config.AWS.COLLECTION_ID,
+      Image: { Bytes: imageBuffer },
+      MaxFaces: 1,
+      FaceMatchThreshold: config.FACE_MATCH_THRESHOLD,
+    };
+    return await rekognition.searchFacesByImage(params).promise();
+  } catch (error) {
+    // Handle "no face detected in image" gracefully
+    if (
+      error.code === 'InvalidParameterException' &&
+      error.message.includes('no faces')
+    ) {
+      return { FaceMatches: [] };
+    }
+    throw error;
+  }
 }
 
 async function indexFaceInCollection(imageBuffer, userId) {
@@ -165,116 +157,220 @@ async function indexFaceInCollection(imageBuffer, userId) {
   return await rekognition.indexFaces(params).promise();
 }
 
-function generateJWT(payload) {
-  return jwt.sign(payload, config.JWT_SECRET, { expiresIn: config.JWT_EXPIRY });
-}
-
 // ============================================================================
-// ROUTES
+// MIDDLEWARE
 // ============================================================================
 
 /**
- * POST /api/signin - Login for Admin and Staff ONLY
- *
- * Logic:
- * 1. Verify credentials with Clerk.
- * 2. Check Clerk privateMetadata for role.
- * 3. If role is 'user', DENY access (Users cannot signin via password).
- * 4. Upsert to MongoDB with correct role.
+ * Auth Middleware - ONLY for staff & admin
+ * Reads from 'staff' collection (not 'workers')
  */
+async function authMiddleware(req, res, next) {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return sendError(res, 401, 'Authentication token required.');
+
+    const decoded = jwt.verify(token, config.JWT_SECRET);
+    const db = await connectToMongo();
+
+    // Staff & Admin are in the 'staff' collection
+    const staffUser = await db
+      .collection(config.COLLECTIONS.STAFF)
+      .findOne({ userId: decoded.userId });
+
+    if (!staffUser) return sendError(res, 404, 'Staff account not found.');
+    if (!staffUser.isActive) return sendError(res, 403, 'Account deactivated.');
+    if (staffUser.isLocked) return sendError(res, 403, 'Account locked.');
+
+    req.user = staffUser;
+    next();
+  } catch (error) {
+    return sendError(res, 401, 'Invalid or expired token.', error);
+  }
+}
+
+function checkRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.user) return sendError(res, 401, 'Auth required.');
+    if (!allowedRoles.includes(req.user.role)) {
+      return sendError(res, 403, 'Access denied. Insufficient permissions.');
+    }
+    next();
+  };
+}
+
+// ============================================================================
+// ROUTE: POST /api/signin (Staff & Admin ONLY)
+// ============================================================================
 app.post('/api/signin', async (req, res) => {
   try {
     const { email, password } = req.body;
     validateRequiredFields({ email, password }, ['email', 'password']);
 
-    // 1. Verify with Clerk
+    // 1. Get user from Clerk
     const users = await clerkClient.users.getUserList({
       emailAddress: [email],
     });
-    console.log('/api/signin,users', users);
+    // console.log('clerkClient.users.getUserList', users);
+    if (!users || users.length === 0) {
+      await auditLog(
+        'SIGNIN_FAILED',
+        null,
+        null,
+        { email, reason: 'User not found in Clerk' },
+        req,
+      );
+      return sendError(res, 401, 'Invalid credentials.');
+    }
 
-    if (!users?.length) return sendError(res, 401, 'Invalid credentials.');
+    const clerkUser = users[0];
+    // console.log('clerkUser', clerkUser);
 
-    const user = users[0];
-    if (user.locked) return sendError(res, 403, 'Account locked.');
+    // 2. Check role from Clerk metadata — ONLY admin & staff allowed
+    let role = clerkUser.privateMetadata?.role;
+    if (!role) {
+      role = 'staff';
 
-    const { verified } = await clerkClient.users.verifyPassword({
-      userId: user.id,
-      password,
-    });
-    if (!verified) return sendError(res, 401, 'Invalid credentials.');
-
-    // 2. Determine Role from Clerk Private Metadata
-    // Default to 'staff' if not found, as requested.
-    let role = user.privateMetadata?.role || 'staff';
-
-    // SECURITY: Deny access if role is explicitly 'user'
-    // Users should only use face recognition to mark attendance (in/out), not login.
-    if (role === 'user') {
-      logger.warn(
-        `Login denied for user ${email} because role is 'user'. Users must use Face Recognition.`,
+      // Optional: Save the role back to Clerk so it's set for next time
+      try {
+        await clerkClient.users.updateUser(clerkUser.id, {
+          privateMetadata: {
+            ...clerkUser.privateMetadata,
+            role: 'staff',
+          },
+        });
+        logger.info(`Auto-assigned 'staff' role to ${email} in Clerk`);
+      } catch (metaErr) {
+        logger.warn(
+          `Failed to update Clerk metadata for ${email}:`,
+          metaErr.message,
+        );
+        // Don't block login if metadata update fails
+      }
+    }
+    if (!['admin', 'staff'].includes(role)) {
+      await auditLog(
+        'SIGNIN_DENIED',
+        null,
+        null,
+        {
+          email,
+          reason: `Role '${role || 'none'}' is not allowed to sign in`,
+        },
+        req,
       );
       return sendError(
         res,
         403,
-        'Access Denied. Regular users cannot sign in with a password. Please use the Face Recognition terminal.',
+        'Access Denied. Only admin and staff can sign in.',
       );
     }
 
+    // 3. Verify password with Clerk
+    if (clerkUser.locked) {
+      await auditLog(
+        'SIGNIN_FAILED',
+        null,
+        null,
+        { email, reason: 'Account locked in Clerk' },
+        req,
+      );
+      return sendError(res, 403, 'Account locked.');
+    }
+
+    const { verified } = await clerkClient.users.verifyPassword({
+      userId: clerkUser.id,
+      password,
+    });
+
+    if (!verified) {
+      await auditLog(
+        'SIGNIN_FAILED',
+        null,
+        null,
+        { email, reason: 'Wrong password' },
+        req,
+      );
+      return sendError(res, 401, 'Invalid credentials.');
+    }
+
+    // 4. Build userId (username or firstName-lastName)
+    const userId =
+      clerkUser.username ?? `${clerkUser.firstName}-${clerkUser.lastName}`;
+
+    // 5. Upsert into 'staff' collection
     const db = await connectToMongo();
 
-    // 3. Upsert (Update or Insert) User to MongoDB
-    // We ensure the DB role matches the Clerk Metadata role
-    await db.collection('users').updateOne(
-      { userId: user.id },
+    await db.collection(config.COLLECTIONS.STAFF).updateOne(
+      { userId: userId },
       {
         $setOnInsert: {
           isActive: true,
           isLocked: false,
-          enrolledAt: null,
           createdAt: new Date(),
+          createdBy: 'clerk_dashboard',
+          email: email,
         },
         $set: {
           role: role,
+          firstName: clerkUser.firstName,
+          lastName: clerkUser.lastName,
           updatedAt: new Date(),
+          lastSignInAt: new Date(),
         },
       },
       { upsert: true },
     );
 
-    // Fetch the updated user to generate token
-    const dbUser = await db.collection('users').findOne({ userId: user.id });
+    // 6. Fetch updated record to generate token
+    const dbUser = await db
+      .collection(config.COLLECTIONS.STAFF)
+      .findOne({ userId: userId });
 
-    // 4. Generate Token
+    if (!dbUser) {
+      return sendError(res, 500, 'Failed to create staff record.');
+    }
+
+    // 7. Generate JWT
     const token = generateJWT({
-      userId: user.id,
-      email: user.emailAddresses[0]?.emailAddress,
+      userId: dbUser.userId,
+      email: email,
       role: dbUser.role,
     });
 
-    logger.info(`Admin/Staff logged in: ${email} (${role})`);
-    sendSuccess(res, {
+    // 8. Audit Log
+    await auditLog(
+      'SIGNIN_SUCCESS',
+      userId,
+      null,
+      {
+        email,
+        role: dbUser.role,
+      },
+      req,
+    );
+
+    logger.info(`Staff signed in: ${email} (${role})`);
+
+    return sendSuccess(res, {
       message: 'Login successful',
       token,
       user: {
-        id: user.id,
-        email: user.emailAddresses[0]?.emailAddress,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        userId: dbUser.userId,
+        email: email,
+        firstName: clerkUser.firstName,
+        lastName: clerkUser.lastName,
         role: dbUser.role,
       },
     });
   } catch (error) {
-    sendError(res, 401, 'Authentication failed', error);
+    await auditLog('SIGNIN_ERROR', null, null, { error: error.message }, req);
+    return sendError(res, 401, 'Authentication failed', error);
   }
 });
 
-/**
- * POST /api/enroll - Enroll a face (Admin & Staff only)
- * Logic: Staff can only enroll 'user' role. Admin can enroll anyone.
- */
 // ============================================================================
-// ROUTE: /api/enroll
+// ROUTE: POST /api/enroll (Admin & Staff - Enroll workers)
 // ============================================================================
 app.post(
   '/api/enroll',
@@ -283,236 +379,310 @@ app.post(
   upload.single('image'),
   async (req, res) => {
     try {
-      const { userid, firstName, lastName, role, age, designation, location } =
+      const { workerId, firstName, lastName, age, designation, location } =
         req.body;
       const imageBuffer = req.file?.buffer;
 
-      // 1. Basic Validation
-      validateRequiredFields({ userid, imageBuffer }, [
-        'userid',
-        'imageBuffer',
-      ]);
+      // 1. Validation
+      if (!workerId || !imageBuffer) {
+        return sendError(res, 400, 'Worker ID and face image are required.');
+      }
+
+      if (!firstName || !lastName) {
+        return sendError(res, 400, 'First name and last name are required.');
+      }
 
       const db = await connectToMongo();
 
-      // 2. CHECK AWS FACE COLLECTION FIRST
-      // "check aws face id by face, if already registered it has faceid"
+      // 2. Check if this FACE already exists in AWS
       const searchResult = await searchFaceByImage(imageBuffer);
 
       if (searchResult.FaceMatches && searchResult.FaceMatches.length > 0) {
-        const existingExternalId =
-          searchResult.FaceMatches[0].Face.ExternalImageId;
+        const existingId = searchResult.FaceMatches[0].Face.ExternalImageId;
+
+        await auditLog(
+          'ENROLL_FAILED',
+          req.user.userId,
+          workerId,
+          {
+            reason: 'Face already registered',
+            existingUserId: existingId,
+          },
+          req,
+        );
+
         return sendError(
           res,
           409,
-          `This face is already registered to user ID: ${existingExternalId}.`,
+          `This face is already registered to worker ID: ${existingId}.`,
         );
       }
 
-      // 3. FIND USER IN DB
-      const targetUser = await db
-        .collection('users')
-        .findOne({ userId: userid });
+      // 3. Check if worker ID already enrolled
+      const existingWorker = await db
+        .collection(config.COLLECTIONS.WORKERS)
+        .findOne({ workerId: workerId });
 
-      // 4. CHECK IF ALREADY ENROLLED
-      if (targetUser && targetUser.awsFaceId) {
-        return sendError(res, 409, `User ${userid} is already enrolled.`);
+      if (existingWorker && existingWorker.awsFaceId) {
+        await auditLog(
+          'ENROLL_FAILED',
+          req.user.userId,
+          workerId,
+          {
+            reason: 'Worker ID already enrolled',
+          },
+          req,
+        );
+        return sendError(res, 409, `Worker ${workerId} is already enrolled.`);
       }
 
-      // 5. INDEX FACE IN AWS
-      const indexResult = await indexFaceInCollection(imageBuffer, userid);
+      // 4. Index face in AWS Rekognition
+      const indexResult = await indexFaceInCollection(imageBuffer, workerId);
 
       if (!indexResult.FaceRecords || indexResult.FaceRecords.length === 0) {
+        await auditLog(
+          'ENROLL_FAILED',
+          req.user.userId,
+          workerId,
+          {
+            reason: 'No face detected in image',
+          },
+          req,
+        );
         return sendError(res, 400, 'No face detected in image.');
       }
 
       const faceRecord = indexResult.FaceRecords[0].Face;
 
-      // 6. UPSERT TO DATABASE
-      // "if not add details in db" -> If user exists, update. If not, insert.
-      await db.collection('users').updateOne(
-        { userId: userid },
+      // 5. Upsert worker to 'workers' collection
+      await db.collection(config.COLLECTIONS.WORKERS).updateOne(
+        { workerId: workerId },
         {
           $set: {
-            // Update these fields always
+            firstName,
+            lastName,
             awsFaceId: faceRecord.FaceId,
             enrollmentConfidence: faceRecord.Confidence,
             enrolledAt: new Date(),
-            ...(age && { age }),
+            enrolledBy: req.user.userId, // ✅ WHO enrolled this worker
+            enrolledByRole: req.user.role, // ✅ Their role
+            ...(age && { age: parseInt(age) }),
             ...(designation && { designation }),
             ...(location && { location }),
-            // Also update name/role in case they changed
-            ...(firstName && { firstName }),
-            ...(lastName && { lastName }),
-            ...(role && { role }),
           },
           $setOnInsert: {
-            // Only insert these if creating NEW user
             isActive: true,
             isLocked: false,
             createdAt: new Date(),
           },
         },
-        { upsert: true }, // <--- THIS IS THE KEY. It creates if not found.
+        { upsert: true },
       );
 
-      logger.info(`User enrolled: ${userid} by ${req.user.userId}`);
+      // 6. Audit Log
+      await auditLog(
+        'ENROLL_SUCCESS',
+        req.user.userId,
+        workerId,
+        {
+          firstName,
+          lastName,
+          designation,
+          faceId: faceRecord.FaceId,
+          confidence: faceRecord.Confidence,
+        },
+        req,
+      );
 
-      sendSuccess(res, {
-        message: 'Face enrolled successfully',
-        userId: userid,
+      logger.info(
+        `Worker enrolled: ${workerId} by ${req.user.userId} (${req.user.role})`,
+      );
+
+      return sendSuccess(res, {
+        message: 'Worker enrolled successfully',
+        workerId: workerId,
+        enrolledBy: req.user.userId,
       });
     } catch (error) {
-      sendError(res, 500, 'Enrollment failed', error);
+      await auditLog(
+        'ENROLL_ERROR',
+        req.user?.userId,
+        req.body?.workerId,
+        {
+          error: error.message,
+        },
+        req,
+      );
+      return sendError(res, 500, 'Enrollment failed', error);
     }
   },
 );
 
 // ============================================================================
-// ROUTE: /api/userinfo
+// ROUTE: POST /api/recognize (Public - Workers face IN/OUT)
+// NO AUTH NEEDED - Workers don't have accounts
 // ============================================================================
-app.post(
-  '/api/userinfo',
-  authMiddleware,
-  checkRole('admin'),
-  async (req, res) => {
-    try {
-      const { userid } = req.body;
+app.post('/api/recognize', upload.single('image'), async (req, res) => {
+  try {
+    const imageBuffer = req.file?.buffer;
+    const { status } = req.body;
 
-      if (!userid) {
-        return sendError(res, 400, 'User ID is required');
+    // Parse location
+    let location = req.body.location;
+    if (typeof location === 'string') {
+      try {
+        location = JSON.parse(location);
+      } catch (e) {
+        /* keep as is */
       }
-
-      // LOGIC FIX:
-      // Since we removed authMiddleware from /recognize, 'user' role accounts
-      // literally CANNOT have a token to access this route.
-      // Only 'admin' and 'staff' can be authenticated here.
-      // Therefore, we allow them to see any logs.
-
-      const db = await connectToMongo();
-      const logs = await db
-        .collection('logger')
-        .find({ userId: userid }, { projection: { awsFaceId: 0 } }) // Hide awsFaceId for privacy
-        .sort({ createdAt: -1 })
-        .toArray();
-
-      sendSuccess(res, { logs, count: logs.length });
-    } catch (error) {
-      sendError(res, 500, 'Failed to retrieve info', error);
     }
-  },
-);
 
-/**
- * POST /api/recognize - Mark Attendance (Admin, Staff, User)
- * Logic: Uses Face Recognition. Checks IN/OUT logic.
- */
-app.post(
-  '/api/recognize',
-  // authMiddleware, // <--- Kept commented out for public access
-  upload.single('image'),
-  async (req, res) => {
-    try {
-      const imageBuffer = req.file?.buffer;
-      const { status } = req.body;
-      // Parse location if it comes as a stringified JSON from frontend
-      let location = req.body.location;
-      if (typeof location === 'string') {
-        try {
-          location = JSON.parse(location);
-        } catch (e) {
-          console.warn('Failed to parse location string, keeping as is');
-        }
-      }
+    // 1. Validation
+    if (!imageBuffer) return sendError(res, 400, 'No image provided.');
 
-      // 1. Validation
-      if (!imageBuffer) return sendError(res, 400, 'No image provided');
+    const normalizedStatus = status ? status.toUpperCase() : 'IN';
+    if (normalizedStatus !== 'IN' && normalizedStatus !== 'OUT') {
+      return sendError(res, 400, "Status must be 'IN' or 'OUT'.");
+    }
 
-      const normalizedStatus = status ? status.toUpperCase() : 'IN';
-      if (normalizedStatus !== 'IN' && normalizedStatus !== 'OUT') {
-        return sendError(res, 400, "Status must be 'IN' or 'OUT'.");
-      }
+    const db = await connectToMongo();
 
-      const db = await connectToMongo();
+    // 2. Search face in AWS
+    const searchResult = await searchFaceByImage(imageBuffer);
 
-      // 2. Search AWS
-      const searchResult = await searchFaceByImage(imageBuffer);
-      if (!searchResult.FaceMatches || searchResult.FaceMatches.length === 0) {
-        return sendError(res, 404, 'Face not recognized.');
-      }
+    if (!searchResult.FaceMatches || searchResult.FaceMatches.length === 0) {
+      await auditLog(
+        'RECOGNIZE_FAILED',
+        'SYSTEM',
+        null,
+        {
+          reason: 'Face not recognized',
+        },
+        req,
+      );
+      return sendError(res, 404, 'Face not recognized. Please contact staff.');
+    }
 
-      const match = searchResult.FaceMatches[0];
-      const similarity = match.Similarity;
-      // FIX: Use ExternalImageId (which should be your userId string)
-      const matchedUserId = match.Face.ExternalImageId;
+    const match = searchResult.FaceMatches[0];
+    const similarity = match.Similarity;
+    const matchedWorkerId = match.Face.ExternalImageId;
 
-      if (similarity < config.FACE_VERIFICATION_THRESHOLD) {
-        return sendError(
-          res,
-          401,
-          `Low confidence: ${Math.round(similarity)}%.`,
-        );
-      }
+    if (similarity < config.FACE_VERIFICATION_THRESHOLD) {
+      await auditLog(
+        'RECOGNIZE_LOW_CONFIDENCE',
+        'SYSTEM',
+        matchedWorkerId,
+        {
+          similarity: Math.round(similarity),
+        },
+        req,
+      );
+      return sendError(res, 401, `Low confidence: ${Math.round(similarity)}%.`);
+    }
 
-      // 3. Get User from DB using the ID found in AWS
-      const user = await db
-        .collection('users')
-        .findOne({ userId: matchedUserId });
+    // 3. Get worker from DB
+    const worker = await db
+      .collection(config.COLLECTIONS.WORKERS)
+      .findOne({ workerId: matchedWorkerId });
 
-      if (!user) {
-        return sendError(res, 404, 'User found in AWS but not in Database.');
-      }
+    if (!worker) {
+      return sendError(
+        res,
+        404,
+        'Worker found in AWS but not in database. Contact admin.',
+      );
+    }
 
-      // 4. Check Duplicates Today (Use the ID from the Face, not the Token)
-      const startOfDay = new Date();
-      startOfDay.setHours(0, 0, 0, 0);
+    if (!worker.isActive) {
+      return sendError(res, 403, 'Your account is deactivated. Contact admin.');
+    }
 
-      const existingLog = await db.collection('logger').findOne({
-        userId: matchedUserId, // <--- FIX: Use matchedUserId instead of req.user.userId
+    if (worker.isLocked) {
+      return sendError(res, 403, 'Your account is locked. Contact admin.');
+    }
+
+    // 4. Check if already marked today
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const existingLog = await db
+      .collection(config.COLLECTIONS.ATTENDANCE)
+      .findOne({
+        workerId: matchedWorkerId,
         status: normalizedStatus,
         createdAt: { $gte: startOfDay },
       });
 
-      if (existingLog) {
-        return sendError(
-          res,
-          409,
-          `Already marked ${normalizedStatus} today at ${new Date(existingLog.createdAt).toLocaleTimeString()}.`,
-        );
-      }
-
-      // 5. Update User Status
-      await db.collection('users').updateOne(
-        { userId: matchedUserId }, // <--- FIX: Use matchedUserId
-        { $set: { lastStatus: normalizedStatus, lastStatusAt: new Date() } },
+    if (existingLog) {
+      return sendError(
+        res,
+        409,
+        `Already marked ${normalizedStatus} today at ${new Date(existingLog.createdAt).toLocaleTimeString()}.`,
       );
-
-      // 6. Log Attendance
-      await db.collection('logger').insertOne({
-        userId: matchedUserId, // <--- FIX: Use matchedUserId
-        awsFaceId: user.awsFaceId, // Get ID from DB user object
-        status: normalizedStatus,
-        createdAt: new Date(),
-        location: location || null,
-        similarity: Math.round(similarity),
-      });
-
-      // FIX: Use matchedUserId in logger (req.user is undefined)
-      logger.info(`Attendance: ${matchedUserId} -> ${normalizedStatus}`);
-
-      sendSuccess(res, {
-        message: `Marked ${normalizedStatus} successfully`,
-        userId: matchedUserId,
-        status: normalizedStatus,
-        similarity: Math.round(similarity),
-      });
-    } catch (error) {
-      sendError(res, 500, 'Recognition failed', error);
     }
-  },
-);
+
+    // 5. Insert attendance record
+    await db.collection(config.COLLECTIONS.ATTENDANCE).insertOne({
+      workerId: matchedWorkerId,
+      workerName: `${worker.firstName} ${worker.lastName}`,
+      status: normalizedStatus,
+      similarity: Math.round(similarity),
+      location: location || null,
+      createdAt: new Date(),
+    });
+
+    // 6. Update worker's last status
+    await db.collection(config.COLLECTIONS.WORKERS).updateOne(
+      { workerId: matchedWorkerId },
+      {
+        $set: {
+          lastStatus: normalizedStatus,
+          lastStatusAt: new Date(),
+        },
+      },
+    );
+
+    // 7. Audit Log
+    await auditLog(
+      `ATTENDANCE_${normalizedStatus}`,
+      'SYSTEM',
+      matchedWorkerId,
+      {
+        similarity: Math.round(similarity),
+        location,
+        workerName: `${worker.firstName} ${worker.lastName}`,
+      },
+      req,
+    );
+
+    logger.info(
+      `Attendance: ${matchedWorkerId} → ${normalizedStatus} (${Math.round(similarity)}%)`,
+    );
+
+    return sendSuccess(res, {
+      message: `Marked ${normalizedStatus} successfully`,
+      workerId: matchedWorkerId,
+      workerName: `${worker.firstName} ${worker.lastName}`,
+      status: normalizedStatus,
+      similarity: Math.round(similarity),
+      time: new Date().toLocaleTimeString(),
+    });
+  } catch (error) {
+    await auditLog(
+      'RECOGNIZE_ERROR',
+      'SYSTEM',
+      null,
+      {
+        error: error.message,
+      },
+      req,
+    );
+    return sendError(res, 500, 'Recognition failed', error);
+  }
+});
+
 // ============================================================================
-// ADMIN ONLY ROUTES
+// ROUTE: POST /api/reports (Admin ONLY - Date Range)
 // ============================================================================
 app.post(
   '/api/reports',
@@ -521,75 +691,51 @@ app.post(
   async (req, res) => {
     try {
       const { startDate, endDate } = req.body;
-      console.log('startDate', startDate);
 
       if (!startDate || !endDate) {
-        return res
-          .status(400)
-          .json({ success: false, error: 'Date range is required' });
+        return sendError(res, 400, 'Start date and end date are required.');
       }
 
       const db = await connectToMongo();
 
-      // 1. Create date range
       const startOfDay = new Date(startDate);
       startOfDay.setHours(0, 0, 0, 0);
 
       const endOfDay = new Date(endDate);
       endOfDay.setHours(23, 59, 59, 999);
 
-      // 2. Get Logs (Directly filter by date, no need to fetch all users first)
-      // FIX: Changed 'creadedAt' to 'createdAt'
       const logs = await db
-        .collection('logger')
-        .find(
-          {
-            createdAt: {
-              // <--- FIXED TYPO
-              $gte: startOfDay,
-              $lte: endOfDay,
-            },
-          },
-          { projection: { awsFaceId: 0 } },
-        )
-        .sort({ createdAt: -1 }) // Sort newest first
+        .collection(config.COLLECTIONS.ATTENDANCE)
+        .find({
+          createdAt: { $gte: startOfDay, $lte: endOfDay },
+        })
+        .sort({ createdAt: -1 })
         .toArray();
 
-      // 3. Get User Details for the logs found (Optimization)
-      // Extract unique user IDs from the logs
-      const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
+      // Audit this report access
+      await auditLog(
+        'REPORT_VIEWED',
+        req.user.userId,
+        null,
+        {
+          type: 'date_range',
+          startDate,
+          endDate,
+          recordCount: logs.length,
+        },
+        req,
+      );
 
-      // Fetch details ONLY for these users
-      const userDetails = await db
-        .collection('users')
-        .find({ userId: { $in: uniqueUserIds } })
-        .project({ _id: 0, awsFaceId: 0, password: 0 }) // Hide sensitive fields
-        .toArray();
-
-      // 4. Combine Data (Map logs to user names)
-      const reportData = logs.map((log) => {
-        const user = userDetails.find((u) => u.userId === log.userId);
-        return {
-          ...log,
-          userName: user
-            ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
-              user.userId
-            : 'Unknown',
-          userRole: user ? user.role : 'unknown',
-        };
-      });
-      console.log('api/reportsdayreportData', reportData);
-      res.json({
-        success: true,
-        data: reportData,
-      });
+      return sendSuccess(res, { data: logs, count: logs.length });
     } catch (error) {
-      console.error('Reports error:', error);
-      res.status(500).json({ success: false, error: error.message });
+      return sendError(res, 500, 'Failed to generate report', error);
     }
   },
 );
 
+// ============================================================================
+// ROUTE: POST /api/reports/month (Admin ONLY - Monthly)
+// ============================================================================
 app.post(
   '/api/reports/month',
   authMiddleware,
@@ -597,27 +743,19 @@ app.post(
   async (req, res) => {
     try {
       const { date: monthName, year } = req.body;
-
-      // Default to current year if not provided
       const targetYear = year ? parseInt(year) : new Date().getFullYear();
 
       if (!monthName) {
-        return res
-          .status(400)
-          .json({ success: false, error: 'Month name is required' });
+        return sendError(res, 400, 'Month name is required.');
+      }
+
+      const monthIndex = new Date(`${monthName} 1, ${targetYear}`).getMonth();
+      if (isNaN(monthIndex)) {
+        return sendError(res, 400, 'Invalid month name.');
       }
 
       const db = await connectToMongo();
 
-      // 1. Convert month name to index (e.g. "January" -> 0)
-      const monthIndex = new Date(`${monthName} 1, ${targetYear}`).getMonth();
-      if (isNaN(monthIndex)) {
-        return res
-          .status(400)
-          .json({ success: false, error: 'Invalid month name' });
-      }
-
-      // 2. Calculate start and end of month
       const startOfMonth = new Date(targetYear, monthIndex, 1);
       const endOfMonth = new Date(
         targetYear,
@@ -629,211 +767,196 @@ app.post(
         999,
       );
 
-      // 3. Get Logs
-      // FIX: Changed 'creadedAt' to 'createdAt'
       const logs = await db
-        .collection('logger')
-        .find(
-          {
-            createdAt: {
-              // <--- FIXED TYPO
-              $gte: startOfMonth,
-              $lte: endOfMonth,
-            },
-          },
-          { projection: { awsFaceId: 0 } },
-        )
+        .collection(config.COLLECTIONS.ATTENDANCE)
+        .find({
+          createdAt: { $gte: startOfMonth, $lte: endOfMonth },
+        })
         .sort({ createdAt: -1 })
         .toArray();
 
-      // 4. Get User Details
-      const uniqueUserIds = [...new Set(logs.map((log) => log.userId))];
-      const userDetails = await db
-        .collection('users')
-        .find({ userId: { $in: uniqueUserIds } })
-        .project({ _id: 0, awsFaceId: 0 })
-        .toArray();
+      await auditLog(
+        'REPORT_VIEWED',
+        req.user.userId,
+        null,
+        {
+          type: 'monthly',
+          month: monthName,
+          year: targetYear,
+          recordCount: logs.length,
+        },
+        req,
+      );
 
-      // 5. Combine Data
-      const reportData = logs.map((log) => {
-        const user = userDetails.find((u) => u.userId === log.userId);
-        return {
-          ...log,
-          userName: user
-            ? `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
-              user.userId
-            : 'Unknown',
-          userRole: user ? user.role : 'unknown',
-        };
-      });
-      console.log('reportData', reportData);
-
-      res.json({
-        success: true,
-        data: reportData,
-      });
+      return sendSuccess(res, { data: logs, count: logs.length });
     } catch (error) {
-      console.error('Reports error:', error);
-      res.status(500).json({ success: false, error: error.message });
+      return sendError(res, 500, 'Failed to generate report', error);
     }
   },
 );
 
+// ============================================================================
+// ROUTE: POST /api/workers (Admin ONLY - List all workers)
+// ============================================================================
 app.post(
-  '/api/listusers',
+  '/api/workers',
   authMiddleware,
   checkRole('admin'),
   async (req, res) => {
     try {
       const db = await connectToMongo();
-      const users = await db
-        .collection('users')
+      const workers = await db
+        .collection(config.COLLECTIONS.WORKERS)
         .find({}, { projection: { awsFaceId: 0, enrollmentConfidence: 0 } })
         .sort({ createdAt: -1 })
         .toArray();
 
-      const formattedUsers = users.map((u) => ({
-        ...u,
-        createdAt: u.createdAt ? new Date(u.createdAt).toLocaleString() : null,
-      }));
-
-      sendSuccess(res, { users: formattedUsers, count: users.length });
+      return sendSuccess(res, { workers, count: workers.length });
     } catch (error) {
-      sendError(res, 500, 'Failed to retrieve users', error);
+      return sendError(res, 500, 'Failed to retrieve workers', error);
     }
   },
 );
 
-// app.post('/api/userinfo', authMiddleware, async (req, res) => {
-//   try {
-//     const { userid } = req.body;
-//     // Admin/Staff can see any. User can only see self.
-//     if (req.user.role === 'user' && req.user.userId !== userid) {
-//       return sendError(res, 403, 'Access denied.');
-//     }
-
-//     const db = await connectToMongo();
-//     const logs = await db
-//       .collection('logger')
-//       .find({ userId: userid }, { projection: { awsFaceId: 0 } })
-//       .sort({ createdAt: -1 })
-//       .toArray();
-
-//     sendSuccess(res, { logs, count: logs.length });
-//   } catch (error) {
-//     sendError(res, 500, 'Failed to retrieve info', error);
-//   }
-// });
-
-// Admin: Create User
+// ============================================================================
+// ROUTE: POST /api/worker/info (Admin ONLY - Single worker's attendance)
+// ============================================================================
 app.post(
-  '/api/admin/users/create',
+  '/api/worker/info',
   authMiddleware,
   checkRole('admin'),
   async (req, res) => {
     try {
-      const { emailAddress, firstName, lastName, password, role } = req.body;
-      validateRequiredFields({ emailAddress, firstName, lastName, password }, [
-        'emailAddress',
-        'firstName',
-        'lastName',
-        'password',
-      ]);
+      const { workerId } = req.body;
 
-      // Set role in Clerk Private Metadata
-      const clerkUser = await clerkClient.users.createUser({
-        emailAddress: [emailAddress],
-        firstName,
-        lastName,
-        password,
-        privateMetadata: { role: role || 'user' }, // Default to user if not specified
-      });
+      if (!workerId) {
+        return sendError(res, 400, 'Worker ID is required.');
+      }
 
       const db = await connectToMongo();
-      await db.collection('users').insertOne({
-        userId: clerkUser.id,
-        role: role || 'user',
-        isActive: true,
-        isLocked: false,
-        enrolledAt: null,
-        createdAt: new Date(),
-      });
 
-      sendSuccess(res, { message: 'User created', userId: clerkUser.id }, 201);
+      const worker = await db
+        .collection(config.COLLECTIONS.WORKERS)
+        .findOne({ workerId }, { projection: { awsFaceId: 0 } });
+
+      if (!worker) {
+        return sendError(res, 404, 'Worker not found.');
+      }
+
+      const attendance = await db
+        .collection(config.COLLECTIONS.ATTENDANCE)
+        .find({ workerId })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      await auditLog(
+        'WORKER_INFO_VIEWED',
+        req.user.userId,
+        workerId,
+        {
+          recordCount: attendance.length,
+        },
+        req,
+      );
+
+      return sendSuccess(res, { worker, attendance, count: attendance.length });
     } catch (error) {
-      if (error.errors) return sendError(res, 400, error.errors[0].message);
-      sendError(res, 500, 'Failed to create user', error);
+      return sendError(res, 500, 'Failed to retrieve worker info', error);
     }
   },
 );
 
-// Admin: Update Role
-app.put(
-  '/api/admin/users/:userId/role',
-  authMiddleware,
-  checkRole('admin'),
-  async (req, res) => {
-    try {
-      const { userId } = req.params;
-      const { role } = req.body;
-      const validRoles = ['user', 'staff', 'admin'];
-      if (!validRoles.includes(role))
-        return sendError(res, 400, 'Invalid role');
+// ============================================================================
+// ROUTE: POST /api/audit (Admin ONLY - View audit logs)
+// ============================================================================
+app.post('/api/audit', authMiddleware, checkRole('admin'), async (req, res) => {
+  try {
+    const { startDate, endDate, action, limit = 100 } = req.body;
 
-      const db = await connectToMongo();
-      await db.collection('users').updateOne({ userId }, { $set: { role } });
+    const db = await connectToMongo();
 
-      // Update Clerk metadata as well to keep in sync
-      await clerkClient.users.updateUser(userId, { privateMetadata: { role } });
+    const query = {};
 
-      sendSuccess(res, { message: 'Role updated' });
-    } catch (error) {
-      sendError(res, 500, 'Failed to update role', error);
+    if (startDate && endDate) {
+      query.createdAt = {
+        $gte: new Date(startDate),
+        $lte: new Date(endDate),
+      };
     }
-  },
-);
 
-// Admin: Lock/Unlock
+    if (action) {
+      query.action = action;
+    }
+
+    const logs = await db
+      .collection(config.COLLECTIONS.AUDIT)
+      .find(query)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .toArray();
+
+    return sendSuccess(res, { logs, count: logs.length });
+  } catch (error) {
+    return sendError(res, 500, 'Failed to retrieve audit logs', error);
+  }
+});
+
+// ============================================================================
+// ROUTE: PUT /api/admin/workers/:workerId/lock (Admin ONLY)
+// ============================================================================
 app.put(
-  '/api/admin/users/:userId/lock',
+  '/api/admin/workers/:workerId/lock',
   authMiddleware,
   checkRole('admin'),
   async (req, res) => {
     try {
-      const { userId } = req.params;
+      const { workerId } = req.params;
       const { isLocked } = req.body;
 
       const db = await connectToMongo();
-      const user = await db.collection('users').findOne({ userId });
-      if (!user) return sendError(res, 404, 'User not found');
 
-      // Sync Lock Status
-      if (user.role === 'admin' || user.role === 'staff') {
-        if (isLocked) await clerkClient.users.lockUser(userId);
-        else await clerkClient.users.unlockUser(userId);
-      } else {
-        await db
-          .collection('users')
-          .updateOne({ userId }, { $set: { isLocked } });
-      }
+      const worker = await db
+        .collection(config.COLLECTIONS.WORKERS)
+        .findOne({ workerId });
 
-      sendSuccess(res, { message: `User ${isLocked ? 'locked' : 'unlocked'}` });
+      if (!worker) return sendError(res, 404, 'Worker not found.');
+
+      await db
+        .collection(config.COLLECTIONS.WORKERS)
+        .updateOne({ workerId }, { $set: { isLocked, updatedAt: new Date() } });
+
+      await auditLog(
+        isLocked ? 'WORKER_LOCKED' : 'WORKER_UNLOCKED',
+        req.user.userId,
+        workerId,
+        { previousState: worker.isLocked },
+        req,
+      );
+
+      return sendSuccess(res, {
+        message: `Worker ${isLocked ? 'locked' : 'unlocked'} successfully.`,
+      });
     } catch (error) {
-      sendError(res, 500, 'Failed to update lock status', error);
+      return sendError(res, 500, 'Failed to update lock status', error);
     }
   },
 );
 
 // ============================================================================
-// SERVER STARTUP
+// ERROR HANDLER
 // ============================================================================
 app.use((err, _req, res, _next) => {
-  logger.error(err);
-  res.status(500).json({ success: false, message: 'Server Error' });
+  logger.error('Unhandled error:', err);
+  return res
+    .status(500)
+    .json({ success: false, message: 'Internal Server Error' });
 });
 
-const server = app.listen(config.PORT, '0.0.0.0', async () => {
-  logger.info(`Server running on port ${config.PORT}`);
+// ============================================================================
+// START SERVER
+// ============================================================================
+app.listen(config.PORT, '0.0.0.0', async () => {
+  logger.info(`Server running on port ${config.PORT} (${config.NODE_ENV})`);
   // 2. Delete this batch (max 100 face IDs per call)
   // const listParams = {
   //   CollectionId: config.AWS.COLLECTION_ID,
@@ -858,4 +981,3 @@ const server = app.listen(config.PORT, '0.0.0.0', async () => {
 });
 
 module.exports = app;
-
