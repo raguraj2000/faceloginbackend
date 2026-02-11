@@ -6,7 +6,7 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { connectToMongo } = require('./mongodb');
 const { createClerkClient } = require('@clerk/clerk-sdk-node');
-const logger = require('./utils/logger');
+const logger = require('./logger');
 
 // ============================================================================
 // CONSTANTS
@@ -981,3 +981,4 @@ app.listen(config.PORT, '0.0.0.0', async () => {
 });
 
 module.exports = app;
+
