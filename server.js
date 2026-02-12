@@ -11,6 +11,9 @@ const logger = require('./logger');
 // ============================================================================
 // CONSTANTS
 // ============================================================================
+const TIMEZONE = 'Asia/Kolkata'; // IST (UTC+5:30) — All users are in India
+const IST_OFFSET = '+05:30';
+
 const config = {
   PORT: process.env.PORT || 3000,
   NODE_ENV: process.env.NODE_ENV || 'development',
@@ -29,12 +32,11 @@ const config = {
     origin: process.env.CORS_ORIGIN || true,
     credentials: true,
   },
-  // Collection Names - Single source of truth
   COLLECTIONS: {
-    STAFF: 'staff', // Admin & Staff accounts
-    WORKERS: 'workers', // Face-enrolled workers
-    ATTENDANCE: 'attendance', // IN/OUT logs
-    AUDIT: 'audit_logs', // Everything audited here
+    STAFF: 'staff',
+    WORKERS: 'workers',
+    ATTENDANCE: 'attendance',
+    AUDIT: 'audit_logs',
   },
 };
 
@@ -66,7 +68,7 @@ const clerkClient = createClerkClient({
 app.use(cors(config.CORS));
 app.use(express.json());
 
-// Request Logger (with password redaction)
+// Request Logger
 app.use((req, _res, next) => {
   const sanitizedBody = { ...req.body };
   if (sanitizedBody.password) sanitizedBody.password = '***REDACTED***';
@@ -75,7 +77,61 @@ app.use((req, _res, next) => {
 });
 
 // ============================================================================
-// HELPERS
+// IST TIMESTAMP HELPERS — Server always uses Indian Standard Time
+// ============================================================================
+
+/**
+ * Get current IST timestamp with all needed formats.
+ * No frontend input needed — server converts UTC → IST.
+ */
+function getISTTimestamp() {
+  const now = new Date();
+
+  const localDate = now.toLocaleDateString('en-CA', {
+    timeZone: TIMEZONE,
+  }); // "2025-01-15"
+
+  const localTime = now.toLocaleTimeString('en-US', {
+    timeZone: TIMEZONE,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: true,
+  }); // "08:00:00 PM"
+
+  return {
+    utc: now,
+    iso: now.toISOString(),
+    localDate,
+    localTime,
+    timezone: TIMEZONE,
+  };
+}
+
+/**
+ * Get start of today in IST → returned as UTC Date for MongoDB queries.
+ * IST midnight (00:00) = UTC 18:30 previous day.
+ */
+function getISTStartOfDay(date = new Date()) {
+  const istDateStr = date.toLocaleDateString('en-CA', {
+    timeZone: TIMEZONE,
+  });
+  return new Date(`${istDateStr}T00:00:00${IST_OFFSET}`);
+}
+
+/**
+ * Get end of today in IST → returned as UTC Date for MongoDB queries.
+ * IST 23:59:59.999 = UTC 18:29:59.999 same day.
+ */
+function getISTEndOfDay(date = new Date()) {
+  const istDateStr = date.toLocaleDateString('en-CA', {
+    timeZone: TIMEZONE,
+  });
+  return new Date(`${istDateStr}T23:59:59.999${IST_OFFSET}`);
+}
+
+// ============================================================================
+// GENERAL HELPERS
 // ============================================================================
 function validateRequiredFields(data, fields) {
   const missing = fields.filter((field) => !data[field]);
@@ -101,23 +157,29 @@ function generateJWT(payload) {
 }
 
 // ============================================================================
-// AUDIT LOGGER - Logs everything to audit_logs collection
+// AUDIT LOGGER
 // ============================================================================
 async function auditLog(action, performedBy, targetUser, details, req) {
   try {
     const db = await connectToMongo();
+    const ist = getISTTimestamp();
     await db.collection(config.COLLECTIONS.AUDIT).insertOne({
-      action, // e.g., 'SIGNIN', 'ENROLL', 'ATTENDANCE_IN', 'ROLE_UPDATE'
-      performedBy, // userId of who did it (staff/admin) or 'SYSTEM'
-      targetUser, // userId of who it was done to (or null)
-      details, // Any extra info
+      action,
+      performedBy,
+      targetUser,
+      details,
       ipAddress: req?.ip || req?.connection?.remoteAddress || null,
       userAgent: req?.headers?.['user-agent'] || null,
-      createdAt: new Date(),
+      timestamps: {
+        utc: ist.utc,
+        localDate: ist.localDate,
+        localTime: ist.localTime,
+        timezone: ist.timezone,
+      },
+      createdAt: ist.utc,
     });
   } catch (error) {
     logger.error('Audit log failed', error);
-    // Don't throw — audit failure shouldn't break the app
   }
 }
 
@@ -134,7 +196,6 @@ async function searchFaceByImage(imageBuffer) {
     };
     return await rekognition.searchFacesByImage(params).promise();
   } catch (error) {
-    // Handle "no face detected in image" gracefully
     if (
       error.code === 'InvalidParameterException' &&
       error.message.includes('no faces')
@@ -173,7 +234,6 @@ async function authMiddleware(req, res, next) {
     const decoded = jwt.verify(token, config.JWT_SECRET);
     const db = await connectToMongo();
 
-    // Staff & Admin are in the 'staff' collection
     const staffUser = await db
       .collection(config.COLLECTIONS.STAFF)
       .findOne({ userId: decoded.userId });
@@ -198,40 +258,7 @@ function checkRole(...allowedRoles) {
     next();
   };
 }
-// ============================================================================
-// ROUTE: GET /api/health (Public - Health Check)
-// ============================================================================
-app.get('/api/health', async (_req, res) => {
-  try {
-    const db = await connectToMongo();
-    await db.command({ ping: 1 });
 
-    return res.status(200).json({
-      success: true,
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      uptime: Math.floor(process.uptime()) + 's',
-      environment: config.NODE_ENV,
-    });
-  } catch (error) {
-    return res.status(503).json({
-      success: false,
-      status: 'unhealthy',
-      timestamp: new Date().toISOString(),
-      error: 'Database connection failed',
-    });
-  }
-});
-
-// ============================================================================
-// ERROR HANDLER
-// ============================================================================
-app.use((err, _req, res, _next) => {
-  logger.error('Unhandled error:', err);
-  return res
-    .status(500)
-    .json({ success: false, message: 'Internal Server Error' });
-});
 // ============================================================================
 // ROUTE: POST /api/signin (Staff & Admin ONLY)
 // ============================================================================
@@ -240,11 +267,10 @@ app.post('/api/signin', async (req, res) => {
     const { email, password } = req.body;
     validateRequiredFields({ email, password }, ['email', 'password']);
 
-    // 1. Get user from Clerk
     const users = await clerkClient.users.getUserList({
       emailAddress: [email],
     });
-    // console.log('clerkClient.users.getUserList', users);
+
     if (!users || users.length === 0) {
       await auditLog(
         'SIGNIN_FAILED',
@@ -257,14 +283,10 @@ app.post('/api/signin', async (req, res) => {
     }
 
     const clerkUser = users[0];
-    // console.log('clerkUser', clerkUser);
 
-    // 2. Check role from Clerk metadata — ONLY admin & staff allowed
     let role = clerkUser.privateMetadata?.role;
     if (!role) {
       role = 'staff';
-
-      // Optional: Save the role back to Clerk so it's set for next time
       try {
         await clerkClient.users.updateUser(clerkUser.id, {
           privateMetadata: {
@@ -278,9 +300,9 @@ app.post('/api/signin', async (req, res) => {
           `Failed to update Clerk metadata for ${email}:`,
           metaErr.message,
         );
-        // Don't block login if metadata update fails
       }
     }
+
     if (!['admin', 'staff'].includes(role)) {
       await auditLog(
         'SIGNIN_DENIED',
@@ -299,7 +321,6 @@ app.post('/api/signin', async (req, res) => {
       );
     }
 
-    // 3. Verify password with Clerk
     if (clerkUser.locked) {
       await auditLog(
         'SIGNIN_FAILED',
@@ -327,12 +348,11 @@ app.post('/api/signin', async (req, res) => {
       return sendError(res, 401, 'Invalid credentials.');
     }
 
-    // 4. Build userId (username or firstName-lastName)
     const userId =
       clerkUser.username ?? `${clerkUser.firstName}-${clerkUser.lastName}`;
 
-    // 5. Upsert into 'staff' collection
     const db = await connectToMongo();
+    const ist = getISTTimestamp();
 
     await db.collection(config.COLLECTIONS.STAFF).updateOne(
       { userId: userId },
@@ -340,7 +360,7 @@ app.post('/api/signin', async (req, res) => {
         $setOnInsert: {
           isActive: true,
           isLocked: false,
-          createdAt: new Date(),
+          createdAt: ist.utc,
           createdBy: 'clerk_dashboard',
           email: email,
         },
@@ -348,14 +368,14 @@ app.post('/api/signin', async (req, res) => {
           role: role,
           firstName: clerkUser.firstName,
           lastName: clerkUser.lastName,
-          updatedAt: new Date(),
-          lastSignInAt: new Date(),
+          updatedAt: ist.utc,
+          lastSignInAt: ist.utc,
+          lastSignInLocal: ist.localTime,
         },
       },
       { upsert: true },
     );
 
-    // 6. Fetch updated record to generate token
     const dbUser = await db
       .collection(config.COLLECTIONS.STAFF)
       .findOne({ userId: userId });
@@ -364,26 +384,21 @@ app.post('/api/signin', async (req, res) => {
       return sendError(res, 500, 'Failed to create staff record.');
     }
 
-    // 7. Generate JWT
     const token = generateJWT({
       userId: dbUser.userId,
       email: email,
       role: dbUser.role,
     });
 
-    // 8. Audit Log
     await auditLog(
       'SIGNIN_SUCCESS',
       userId,
       null,
-      {
-        email,
-        role: dbUser.role,
-      },
+      { email, role: dbUser.role },
       req,
     );
 
-    logger.info(`Staff signed in: ${email} (${role})`);
+    logger.info(`Staff signed in: ${email} (${role}) at ${ist.localTime} IST`);
 
     return sendSuccess(res, {
       message: 'Login successful',
@@ -416,7 +431,6 @@ app.post(
         req.body;
       const imageBuffer = req.file?.buffer;
 
-      // 1. Validation
       if (!workerId || !imageBuffer) {
         return sendError(res, 400, 'Worker ID and face image are required.');
       }
@@ -427,7 +441,6 @@ app.post(
 
       const db = await connectToMongo();
 
-      // 2. Check if this FACE already exists in AWS
       const searchResult = await searchFaceByImage(imageBuffer);
 
       if (searchResult.FaceMatches && searchResult.FaceMatches.length > 0) {
@@ -437,10 +450,7 @@ app.post(
           'ENROLL_FAILED',
           req.user.userId,
           workerId,
-          {
-            reason: 'Face already registered',
-            existingUserId: existingId,
-          },
+          { reason: 'Face already registered', existingUserId: existingId },
           req,
         );
 
@@ -451,7 +461,6 @@ app.post(
         );
       }
 
-      // 3. Check if worker ID already enrolled
       const existingWorker = await db
         .collection(config.COLLECTIONS.WORKERS)
         .findOne({ workerId: workerId });
@@ -461,15 +470,12 @@ app.post(
           'ENROLL_FAILED',
           req.user.userId,
           workerId,
-          {
-            reason: 'Worker ID already enrolled',
-          },
+          { reason: 'Worker ID already enrolled' },
           req,
         );
         return sendError(res, 409, `Worker ${workerId} is already enrolled.`);
       }
 
-      // 4. Index face in AWS Rekognition
       const indexResult = await indexFaceInCollection(imageBuffer, workerId);
 
       if (!indexResult.FaceRecords || indexResult.FaceRecords.length === 0) {
@@ -477,17 +483,15 @@ app.post(
           'ENROLL_FAILED',
           req.user.userId,
           workerId,
-          {
-            reason: 'No face detected in image',
-          },
+          { reason: 'No face detected in image' },
           req,
         );
         return sendError(res, 400, 'No face detected in image.');
       }
 
       const faceRecord = indexResult.FaceRecords[0].Face;
+      const ist = getISTTimestamp();
 
-      // 5. Upsert worker to 'workers' collection
       await db.collection(config.COLLECTIONS.WORKERS).updateOne(
         { workerId: workerId },
         {
@@ -496,9 +500,10 @@ app.post(
             lastName,
             awsFaceId: faceRecord.FaceId,
             enrollmentConfidence: faceRecord.Confidence,
-            enrolledAt: new Date(),
-            enrolledBy: req.user.userId, // ✅ WHO enrolled this worker
-            enrolledByRole: req.user.role, // ✅ Their role
+            enrolledAt: ist.utc,
+            enrolledAtLocal: `${ist.localDate} ${ist.localTime}`,
+            enrolledBy: req.user.userId,
+            enrolledByRole: req.user.role,
             ...(age && { age: parseInt(age) }),
             ...(designation && { designation }),
             ...(location && { location }),
@@ -506,13 +511,12 @@ app.post(
           $setOnInsert: {
             isActive: true,
             isLocked: false,
-            createdAt: new Date(),
+            createdAt: ist.utc,
           },
         },
         { upsert: true },
       );
 
-      // 6. Audit Log
       await auditLog(
         'ENROLL_SUCCESS',
         req.user.userId,
@@ -528,7 +532,7 @@ app.post(
       );
 
       logger.info(
-        `Worker enrolled: ${workerId} by ${req.user.userId} (${req.user.role})`,
+        `Worker enrolled: ${workerId} by ${req.user.userId} (${req.user.role}) at ${ist.localTime} IST`,
       );
 
       return sendSuccess(res, {
@@ -541,9 +545,7 @@ app.post(
         'ENROLL_ERROR',
         req.user?.userId,
         req.body?.workerId,
-        {
-          error: error.message,
-        },
+        { error: error.message },
         req,
       );
       return sendError(res, 500, 'Enrollment failed', error);
@@ -553,7 +555,8 @@ app.post(
 
 // ============================================================================
 // ROUTE: POST /api/recognize (Public - Workers face IN/OUT)
-// NO AUTH NEEDED - Workers don't have accounts
+// NO AUTH NEEDED — NO FRONTEND CHANGES NEEDED
+// Server handles IST conversion automatically
 // ============================================================================
 app.post('/api/recognize', upload.single('image'), async (req, res) => {
   try {
@@ -578,6 +581,9 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       return sendError(res, 400, "Status must be 'IN' or 'OUT'.");
     }
 
+    // ✅ Get IST timestamp — no frontend data needed
+    const ist = getISTTimestamp();
+
     const db = await connectToMongo();
 
     // 2. Search face in AWS
@@ -588,9 +594,7 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
         'RECOGNIZE_FAILED',
         'SYSTEM',
         null,
-        {
-          reason: 'Face not recognized',
-        },
+        { reason: 'Face not recognized' },
         req,
       );
       return sendError(res, 404, 'Face not recognized. Please contact staff.');
@@ -605,9 +609,7 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
         'RECOGNIZE_LOW_CONFIDENCE',
         'SYSTEM',
         matchedWorkerId,
-        {
-          similarity: Math.round(similarity),
-        },
+        { similarity: Math.round(similarity) },
         req,
       );
       return sendError(res, 401, `Low confidence: ${Math.round(similarity)}%.`);
@@ -634,34 +636,44 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       return sendError(res, 403, 'Your account is locked. Contact admin.');
     }
 
-    // 4. Check if already marked today
-    const startOfDay = new Date();
-    startOfDay.setHours(0, 0, 0, 0);
+    // ✅ 4. Check duplicate — IST day boundaries (midnight to midnight IST)
+    const istStartOfDay = getISTStartOfDay();
+    const istEndOfDay = getISTEndOfDay();
 
     const existingLog = await db
       .collection(config.COLLECTIONS.ATTENDANCE)
       .findOne({
         workerId: matchedWorkerId,
         status: normalizedStatus,
-        createdAt: { $gte: startOfDay },
+        'timestamps.utc': { $gte: istStartOfDay, $lte: istEndOfDay },
       });
 
     if (existingLog) {
       return sendError(
         res,
         409,
-        `Already marked ${normalizedStatus} today at ${new Date(existingLog.createdAt).toLocaleTimeString()}.`,
+        `Already marked ${normalizedStatus} today at ${existingLog.timestamps?.localTime || 'earlier'}.`,
       );
     }
 
-    // 5. Insert attendance record
+    // ✅ 5. Insert attendance with IST timestamps
     await db.collection(config.COLLECTIONS.ATTENDANCE).insertOne({
       workerId: matchedWorkerId,
       workerName: `${worker.firstName} ${worker.lastName}`,
       status: normalizedStatus,
       similarity: Math.round(similarity),
       location: location || null,
-      createdAt: new Date(),
+
+      // ✅ STANDARDIZED IST TIMESTAMP
+      timestamps: {
+        utc: ist.utc,
+        iso: ist.iso,
+        localDate: ist.localDate,
+        localTime: ist.localTime,
+        timezone: ist.timezone,
+      },
+
+      createdAt: ist.utc,
     });
 
     // 6. Update worker's last status
@@ -670,7 +682,8 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       {
         $set: {
           lastStatus: normalizedStatus,
-          lastStatusAt: new Date(),
+          lastStatusAt: ist.utc,
+          lastStatusLocal: ist.localTime,
         },
       },
     );
@@ -684,30 +697,32 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
         similarity: Math.round(similarity),
         location,
         workerName: `${worker.firstName} ${worker.lastName}`,
+        localTime: ist.localTime,
+        localDate: ist.localDate,
       },
       req,
     );
 
     logger.info(
-      `Attendance: ${matchedWorkerId} → ${normalizedStatus} (${Math.round(similarity)}%)`,
+      `Attendance: ${matchedWorkerId} → ${normalizedStatus} at ${ist.localTime} IST [${Math.round(similarity)}%]`,
     );
 
+    // ✅ Return IST time to frontend
     return sendSuccess(res, {
       message: `Marked ${normalizedStatus} successfully`,
       workerId: matchedWorkerId,
       workerName: `${worker.firstName} ${worker.lastName}`,
       status: normalizedStatus,
       similarity: Math.round(similarity),
-      time: new Date().toLocaleTimeString(),
+      time: ist.localTime,
+      date: ist.localDate,
     });
   } catch (error) {
     await auditLog(
       'RECOGNIZE_ERROR',
       'SYSTEM',
       null,
-      {
-        error: error.message,
-      },
+      { error: error.message },
       req,
     );
     return sendError(res, 500, 'Recognition failed', error);
@@ -715,7 +730,7 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE: POST /api/reports (Admin ONLY - Date Range)
+// ROUTE: POST /api/reports (Admin ONLY - Date Range, IST-aware)
 // ============================================================================
 app.post(
   '/api/reports',
@@ -731,21 +746,18 @@ app.post(
 
       const db = await connectToMongo();
 
-      const startOfDay = new Date(startDate);
-      startOfDay.setHours(0, 0, 0, 0);
-
-      const endOfDay = new Date(endDate);
-      endOfDay.setHours(23, 59, 59, 999);
+      // ✅ Parse as IST boundaries
+      const startIST = new Date(`${startDate}T00:00:00${IST_OFFSET}`);
+      const endIST = new Date(`${endDate}T23:59:59.999${IST_OFFSET}`);
 
       const logs = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({
-          createdAt: { $gte: startOfDay, $lte: endOfDay },
+          'timestamps.utc': { $gte: startIST, $lte: endIST },
         })
-        .sort({ createdAt: -1 })
+        .sort({ 'timestamps.utc': -1 })
         .toArray();
 
-      // Audit this report access
       await auditLog(
         'REPORT_VIEWED',
         req.user.userId,
@@ -767,7 +779,7 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/reports/month (Admin ONLY - Monthly)
+// ROUTE: POST /api/reports/month (Admin ONLY - Monthly, IST-aware)
 // ============================================================================
 app.post(
   '/api/reports/month',
@@ -789,23 +801,23 @@ app.post(
 
       const db = await connectToMongo();
 
-      const startOfMonth = new Date(targetYear, monthIndex, 1);
-      const endOfMonth = new Date(
-        targetYear,
-        monthIndex + 1,
-        0,
-        23,
-        59,
-        59,
-        999,
+      // ✅ IST month boundaries
+      const monthStr = String(monthIndex + 1).padStart(2, '0');
+      const lastDay = new Date(targetYear, monthIndex + 1, 0).getDate();
+
+      const startIST = new Date(
+        `${targetYear}-${monthStr}-01T00:00:00${IST_OFFSET}`,
+      );
+      const endIST = new Date(
+        `${targetYear}-${monthStr}-${lastDay}T23:59:59.999${IST_OFFSET}`,
       );
 
       const logs = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({
-          createdAt: { $gte: startOfMonth, $lte: endOfMonth },
+          'timestamps.utc': { $gte: startIST, $lte: endIST },
         })
-        .sort({ createdAt: -1 })
+        .sort({ 'timestamps.utc': -1 })
         .toArray();
 
       await auditLog(
@@ -879,16 +891,14 @@ app.post(
       const attendance = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({ workerId })
-        .sort({ createdAt: -1 })
+        .sort({ 'timestamps.utc': -1 })
         .toArray();
 
       await auditLog(
         'WORKER_INFO_VIEWED',
         req.user.userId,
         workerId,
-        {
-          recordCount: attendance.length,
-        },
+        { recordCount: attendance.length },
         req,
       );
 
@@ -912,8 +922,8 @@ app.post('/api/audit', authMiddleware, checkRole('admin'), async (req, res) => {
 
     if (startDate && endDate) {
       query.createdAt = {
-        $gte: new Date(startDate),
-        $lte: new Date(endDate),
+        $gte: new Date(`${startDate}T00:00:00${IST_OFFSET}`),
+        $lte: new Date(`${endDate}T23:59:59.999${IST_OFFSET}`),
       };
     }
 
@@ -947,6 +957,7 @@ app.put(
       const { isLocked } = req.body;
 
       const db = await connectToMongo();
+      const ist = getISTTimestamp();
 
       const worker = await db
         .collection(config.COLLECTIONS.WORKERS)
@@ -956,7 +967,7 @@ app.put(
 
       await db
         .collection(config.COLLECTIONS.WORKERS)
-        .updateOne({ workerId }, { $set: { isLocked, updatedAt: new Date() } });
+        .updateOne({ workerId }, { $set: { isLocked, updatedAt: ist.utc } });
 
       await auditLog(
         isLocked ? 'WORKER_LOCKED' : 'WORKER_UNLOCKED',
@@ -989,30 +1000,10 @@ app.use((err, _req, res, _next) => {
 // START SERVER
 // ============================================================================
 app.listen(config.PORT, '0.0.0.0', async () => {
-  logger.info(`Server running on port ${config.PORT} (${config.NODE_ENV})`);
-  // 2. Delete this batch (max 100 face IDs per call)
-  // const listParams = {
-  //   CollectionId: config.AWS.COLLECTION_ID,
-  //   MaxResults: 100,
-  // };
-  // const listResponse = await rekognition.listFaces(listParams).promise();
-
-  // const faceIds = listResponse.Faces.map((face) => face.FaceId);
-  // console.log('&&&&&&&&&&&&&&&&&&&&&faceid', faceIds);
-  // const deleteParams = {
-  //   CollectionId: config.AWS.COLLECTION_ID,
-  //   FaceIds: faceIds,
-  // };
-
-  // const deleteResponse = await rekognition.deleteFaces(deleteParams).promise();
-
-  // const deletedThisBatch = deleteResponse.DeletedFaces.length;
-
-  // console.log(
-  //   `Deleted ${deletedThisBatch} faces (total so far: ${deleteResponse})`,
-  // );
+  const ist = getISTTimestamp();
+  logger.info(
+    `Server running on port ${config.PORT} (${config.NODE_ENV}) | IST: ${ist.localDate} ${ist.localTime}`,
+  );
 });
 
 module.exports = app;
-
-
