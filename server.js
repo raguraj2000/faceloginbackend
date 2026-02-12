@@ -11,7 +11,7 @@ const logger = require('./logger');
 // ============================================================================
 // CONSTANTS
 // ============================================================================
-const TIMEZONE = 'Asia/Kolkata'; // IST (UTC+5:30) — All users are in India
+const TIMEZONE = 'Asia/Kolkata';
 const IST_OFFSET = '+05:30';
 
 const config = {
@@ -68,7 +68,6 @@ const clerkClient = createClerkClient({
 app.use(cors(config.CORS));
 app.use(express.json());
 
-// Request Logger
 app.use((req, _res, next) => {
   const sanitizedBody = { ...req.body };
   if (sanitizedBody.password) sanitizedBody.password = '***REDACTED***';
@@ -77,19 +76,14 @@ app.use((req, _res, next) => {
 });
 
 // ============================================================================
-// IST TIMESTAMP HELPERS — Server always uses Indian Standard Time
+// IST TIMESTAMP HELPERS
 // ============================================================================
-
-/**
- * Get current IST timestamp with all needed formats.
- * No frontend input needed — server converts UTC → IST.
- */
 function getISTTimestamp() {
   const now = new Date();
 
   const localDate = now.toLocaleDateString('en-CA', {
     timeZone: TIMEZONE,
-  }); // "2025-01-15"
+  });
 
   const localTime = now.toLocaleTimeString('en-US', {
     timeZone: TIMEZONE,
@@ -97,7 +91,7 @@ function getISTTimestamp() {
     minute: '2-digit',
     second: '2-digit',
     hour12: true,
-  }); // "08:00:00 PM"
+  });
 
   return {
     utc: now,
@@ -108,10 +102,6 @@ function getISTTimestamp() {
   };
 }
 
-/**
- * Get start of today in IST → returned as UTC Date for MongoDB queries.
- * IST midnight (00:00) = UTC 18:30 previous day.
- */
 function getISTStartOfDay(date = new Date()) {
   const istDateStr = date.toLocaleDateString('en-CA', {
     timeZone: TIMEZONE,
@@ -119,10 +109,6 @@ function getISTStartOfDay(date = new Date()) {
   return new Date(`${istDateStr}T00:00:00${IST_OFFSET}`);
 }
 
-/**
- * Get end of today in IST → returned as UTC Date for MongoDB queries.
- * IST 23:59:59.999 = UTC 18:29:59.999 same day.
- */
 function getISTEndOfDay(date = new Date()) {
   const istDateStr = date.toLocaleDateString('en-CA', {
     timeZone: TIMEZONE,
@@ -170,12 +156,9 @@ async function auditLog(action, performedBy, targetUser, details, req) {
       details,
       ipAddress: req?.ip || req?.connection?.remoteAddress || null,
       userAgent: req?.headers?.['user-agent'] || null,
-      timestamps: {
-        utc: ist.utc,
-        localDate: ist.localDate,
-        localTime: ist.localTime,
-        timezone: ist.timezone,
-      },
+      localDate: ist.localDate,
+      localTime: ist.localTime,
+      timezone: ist.timezone,
       createdAt: ist.utc,
     });
   } catch (error) {
@@ -221,11 +204,6 @@ async function indexFaceInCollection(imageBuffer, userId) {
 // ============================================================================
 // MIDDLEWARE
 // ============================================================================
-
-/**
- * Auth Middleware - ONLY for staff & admin
- * Reads from 'staff' collection (not 'workers')
- */
 async function authMiddleware(req, res, next) {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -260,7 +238,7 @@ function checkRole(...allowedRoles) {
 }
 
 // ============================================================================
-// ROUTE: POST /api/signin (Staff & Admin ONLY)
+// ROUTE: POST /api/signin
 // ============================================================================
 app.post('/api/signin', async (req, res) => {
   try {
@@ -355,17 +333,17 @@ app.post('/api/signin', async (req, res) => {
     const ist = getISTTimestamp();
 
     await db.collection(config.COLLECTIONS.STAFF).updateOne(
-      { userId: userId },
+      { userId },
       {
         $setOnInsert: {
           isActive: true,
           isLocked: false,
           createdAt: ist.utc,
           createdBy: 'clerk_dashboard',
-          email: email,
+          email,
         },
         $set: {
-          role: role,
+          role,
           firstName: clerkUser.firstName,
           lastName: clerkUser.lastName,
           updatedAt: ist.utc,
@@ -378,7 +356,7 @@ app.post('/api/signin', async (req, res) => {
 
     const dbUser = await db
       .collection(config.COLLECTIONS.STAFF)
-      .findOne({ userId: userId });
+      .findOne({ userId });
 
     if (!dbUser) {
       return sendError(res, 500, 'Failed to create staff record.');
@@ -386,7 +364,7 @@ app.post('/api/signin', async (req, res) => {
 
     const token = generateJWT({
       userId: dbUser.userId,
-      email: email,
+      email,
       role: dbUser.role,
     });
 
@@ -405,7 +383,7 @@ app.post('/api/signin', async (req, res) => {
       token,
       user: {
         userId: dbUser.userId,
-        email: email,
+        email,
         firstName: clerkUser.firstName,
         lastName: clerkUser.lastName,
         role: dbUser.role,
@@ -418,7 +396,7 @@ app.post('/api/signin', async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE: POST /api/enroll (Admin & Staff - Enroll workers)
+// ROUTE: POST /api/enroll
 // ============================================================================
 app.post(
   '/api/enroll',
@@ -463,7 +441,7 @@ app.post(
 
       const existingWorker = await db
         .collection(config.COLLECTIONS.WORKERS)
-        .findOne({ workerId: workerId });
+        .findOne({ workerId });
 
       if (existingWorker && existingWorker.awsFaceId) {
         await auditLog(
@@ -493,7 +471,7 @@ app.post(
       const ist = getISTTimestamp();
 
       await db.collection(config.COLLECTIONS.WORKERS).updateOne(
-        { workerId: workerId },
+        { workerId },
         {
           $set: {
             firstName,
@@ -537,7 +515,7 @@ app.post(
 
       return sendSuccess(res, {
         message: 'Worker enrolled successfully',
-        workerId: workerId,
+        workerId,
         enrolledBy: req.user.userId,
       });
     } catch (error) {
@@ -554,16 +532,13 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/recognize (Public - Workers face IN/OUT)
-// NO AUTH NEEDED — NO FRONTEND CHANGES NEEDED
-// Server handles IST conversion automatically
+// ROUTE: POST /api/recognize
 // ============================================================================
 app.post('/api/recognize', upload.single('image'), async (req, res) => {
   try {
     const imageBuffer = req.file?.buffer;
     const { status } = req.body;
 
-    // Parse location
     let location = req.body.location;
     if (typeof location === 'string') {
       try {
@@ -573,7 +548,6 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       }
     }
 
-    // 1. Validation
     if (!imageBuffer) return sendError(res, 400, 'No image provided.');
 
     const normalizedStatus = status ? status.toUpperCase() : 'IN';
@@ -581,12 +555,9 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       return sendError(res, 400, "Status must be 'IN' or 'OUT'.");
     }
 
-    // ✅ Get IST timestamp — no frontend data needed
     const ist = getISTTimestamp();
-
     const db = await connectToMongo();
 
-    // 2. Search face in AWS
     const searchResult = await searchFaceByImage(imageBuffer);
 
     if (!searchResult.FaceMatches || searchResult.FaceMatches.length === 0) {
@@ -615,7 +586,6 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       return sendError(res, 401, `Low confidence: ${Math.round(similarity)}%.`);
     }
 
-    // 3. Get worker from DB
     const worker = await db
       .collection(config.COLLECTIONS.WORKERS)
       .findOne({ workerId: matchedWorkerId });
@@ -636,7 +606,7 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       return sendError(res, 403, 'Your account is locked. Contact admin.');
     }
 
-    // ✅ 4. Check duplicate — IST day boundaries (midnight to midnight IST)
+    // Duplicate check using createdAt (single field)
     const istStartOfDay = getISTStartOfDay();
     const istEndOfDay = getISTEndOfDay();
 
@@ -645,38 +615,30 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       .findOne({
         workerId: matchedWorkerId,
         status: normalizedStatus,
-        'timestamps.utc': { $gte: istStartOfDay, $lte: istEndOfDay },
+        createdAt: { $gte: istStartOfDay, $lte: istEndOfDay },
       });
 
     if (existingLog) {
       return sendError(
         res,
         409,
-        `Already marked ${normalizedStatus} today at ${existingLog.timestamps?.localTime || 'earlier'}.`,
+        `Already marked ${normalizedStatus} today at ${existingLog.localTime || 'earlier'}.`,
       );
     }
 
-    // ✅ 5. Insert attendance with IST timestamps
+    // ✅ Clean flat structure — createdAt is the single source of truth
     await db.collection(config.COLLECTIONS.ATTENDANCE).insertOne({
       workerId: matchedWorkerId,
       workerName: `${worker.firstName} ${worker.lastName}`,
       status: normalizedStatus,
       similarity: Math.round(similarity),
       location: location || null,
-
-      // ✅ STANDARDIZED IST TIMESTAMP
-      timestamps: {
-        utc: ist.utc,
-        iso: ist.iso,
-        localDate: ist.localDate,
-        localTime: ist.localTime,
-        timezone: ist.timezone,
-      },
-
+      localDate: ist.localDate,
+      localTime: ist.localTime,
+      timezone: ist.timezone,
       createdAt: ist.utc,
     });
 
-    // 6. Update worker's last status
     await db.collection(config.COLLECTIONS.WORKERS).updateOne(
       { workerId: matchedWorkerId },
       {
@@ -688,7 +650,6 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       },
     );
 
-    // 7. Audit Log
     await auditLog(
       `ATTENDANCE_${normalizedStatus}`,
       'SYSTEM',
@@ -707,7 +668,6 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
       `Attendance: ${matchedWorkerId} → ${normalizedStatus} at ${ist.localTime} IST [${Math.round(similarity)}%]`,
     );
 
-    // ✅ Return IST time to frontend
     return sendSuccess(res, {
       message: `Marked ${normalizedStatus} successfully`,
       workerId: matchedWorkerId,
@@ -730,7 +690,7 @@ app.post('/api/recognize', upload.single('image'), async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE: POST /api/reports (Admin ONLY - Date Range, IST-aware)
+// ROUTE: POST /api/reports (Date Range)
 // ============================================================================
 app.post(
   '/api/reports',
@@ -746,28 +706,23 @@ app.post(
 
       const db = await connectToMongo();
 
-      // ✅ Parse as IST boundaries
       const startIST = new Date(`${startDate}T00:00:00${IST_OFFSET}`);
       const endIST = new Date(`${endDate}T23:59:59.999${IST_OFFSET}`);
 
+      // ✅ Single field query — no $or, no dedup
       const logs = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({
-          'timestamps.utc': { $gte: startIST, $lte: endIST },
+          createdAt: { $gte: startIST, $lte: endIST },
         })
-        .sort({ 'timestamps.utc': -1 })
+        .sort({ createdAt: -1 })
         .toArray();
 
       await auditLog(
         'REPORT_VIEWED',
         req.user.userId,
         null,
-        {
-          type: 'date_range',
-          startDate,
-          endDate,
-          recordCount: logs.length,
-        },
+        { type: 'date_range', startDate, endDate, recordCount: logs.length },
         req,
       );
 
@@ -779,7 +734,7 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/reports/month (Admin ONLY - Monthly, IST-aware)
+// ROUTE: POST /api/reports/month (Monthly)
 // ============================================================================
 app.post(
   '/api/reports/month',
@@ -801,7 +756,6 @@ app.post(
 
       const db = await connectToMongo();
 
-      // ✅ IST month boundaries
       const monthStr = String(monthIndex + 1).padStart(2, '0');
       const lastDay = new Date(targetYear, monthIndex + 1, 0).getDate();
 
@@ -812,12 +766,13 @@ app.post(
         `${targetYear}-${monthStr}-${lastDay}T23:59:59.999${IST_OFFSET}`,
       );
 
+      // ✅ Single field query
       const logs = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({
-          'timestamps.utc': { $gte: startIST, $lte: endIST },
+          createdAt: { $gte: startIST, $lte: endIST },
         })
-        .sort({ 'timestamps.utc': -1 })
+        .sort({ createdAt: -1 })
         .toArray();
 
       await auditLog(
@@ -841,7 +796,7 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/workers (Admin ONLY - List all workers)
+// ROUTE: POST /api/workers (List all)
 // ============================================================================
 app.post(
   '/api/workers',
@@ -864,7 +819,50 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/worker/info (Admin ONLY - Single worker's attendance)
+// ROUTE: POST /api/workers/search (Search workers)
+// ============================================================================
+app.post(
+  '/api/workers/search',
+  authMiddleware,
+  checkRole('admin'),
+  async (req, res) => {
+    try {
+      const { query: searchQuery, status, limit = 50 } = req.body;
+
+      const db = await connectToMongo();
+      const filter = {};
+
+      if (searchQuery && searchQuery.trim()) {
+        const q = searchQuery.trim();
+        filter.$or = [
+          { workerId: { $regex: q, $options: 'i' } },
+          { firstName: { $regex: q, $options: 'i' } },
+          { lastName: { $regex: q, $options: 'i' } },
+        ];
+      }
+
+      if (status && status !== 'all') {
+        filter.lastStatus = status.toUpperCase();
+      }
+
+      const workers = await db
+        .collection(config.COLLECTIONS.WORKERS)
+        .find(filter, {
+          projection: { awsFaceId: 0, enrollmentConfidence: 0 },
+        })
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit))
+        .toArray();
+
+      return sendSuccess(res, { workers, count: workers.length });
+    } catch (error) {
+      return sendError(res, 500, 'Failed to search workers', error);
+    }
+  },
+);
+
+// ============================================================================
+// ROUTE: POST /api/worker/info (Single worker + attendance)
 // ============================================================================
 app.post(
   '/api/worker/info',
@@ -891,7 +889,7 @@ app.post(
       const attendance = await db
         .collection(config.COLLECTIONS.ATTENDANCE)
         .find({ workerId })
-        .sort({ 'timestamps.utc': -1 })
+        .sort({ createdAt: -1 })
         .toArray();
 
       await auditLog(
@@ -910,14 +908,13 @@ app.post(
 );
 
 // ============================================================================
-// ROUTE: POST /api/audit (Admin ONLY - View audit logs)
+// ROUTE: POST /api/audit (View audit logs)
 // ============================================================================
 app.post('/api/audit', authMiddleware, checkRole('admin'), async (req, res) => {
   try {
     const { startDate, endDate, action, limit = 100 } = req.body;
 
     const db = await connectToMongo();
-
     const query = {};
 
     if (startDate && endDate) {
@@ -945,7 +942,7 @@ app.post('/api/audit', authMiddleware, checkRole('admin'), async (req, res) => {
 });
 
 // ============================================================================
-// ROUTE: PUT /api/admin/workers/:workerId/lock (Admin ONLY)
+// ROUTE: PUT /api/admin/workers/:workerId/lock
 // ============================================================================
 app.put(
   '/api/admin/workers/:workerId/lock',
